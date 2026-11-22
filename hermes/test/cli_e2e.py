@@ -70,7 +70,38 @@ def main():
                 "hermes-tool-ok" in json.dumps(message)
                 for message in FakeQoder.observed_tool_messages
             ), FakeQoder.observed_tool_messages
+
+            # `hermes usage` reaches the plugin through a different path than a
+            # turn: agent.account_usage is mid-import when it asks for this
+            # profile, so a module-level `from agent.account_usage import ...`
+            # in the plugin breaks *only* this command. Keep the assertion here.
+            usage_result = subprocess.run(
+                ["hermes", "usage", "--provider", "qoder-cn", "--json"],
+                env=env, cwd=PLUGIN, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,
+            )
+            assert usage_result.returncode == 0, usage_result.stderr
+            document = json.loads(usage_result.stdout)
+            assert document["provider"] == "qoder-cn", document
+            assert document["source"] == "qoder_usage_api", document
+            assert document["plan"] == "personal_standard", document
+            assert [window["label"] for window in document["windows"]] == [
+                "Base quota", "Add-on credits",
+            ], document
+            assert document["windows"][0]["detail"] == "750 of 1000 credits left", document
+            assert "Credits remaining: 950" in document["details"], document
+            assert "Plan expires: 2100-01-01" in document["details"], document
+
+            text_result = subprocess.run(
+                ["hermes", "usage", "--provider", "qoder-cn"],
+                env=env, cwd=PLUGIN, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,
+            )
+            assert text_result.returncode == 0, text_result.stderr
+            assert "Base quota: 75% remaining (25% used)" in text_result.stdout, text_result.stdout
+            assert "Credits remaining: 950" in text_result.stdout, text_result.stdout
         print("PASS: real Hermes CLI streaming and tool round trip")
+        print("PASS: real Hermes CLI usage reads Qoder credits through the gateway")
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

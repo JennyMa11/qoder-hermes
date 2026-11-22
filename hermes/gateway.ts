@@ -86,6 +86,11 @@ async function main(): Promise<void> {
         ? undefined
         : { context_length: model.contextWindow, max_tokens: model.maxOutputTokens }
     },
+    // 额度读数原样交给宿主：上游 `qoderUsage` 的形状（userQuota/addOnQuota/
+    // orgResourcePackage/isQuotaExceeded）由宿主自己解释成它要的卡片。网关不在这里
+    // 折算成百分比——「哪几包算总积分」是产品口径（DSH 侧写在 src/index.ts 的
+    // `creditsOf` 里），协议层替宿主决定会让两边慢慢漂移。
+    usageOf: () => upstream.fetchUsage(pat),
   })
 
   // Keep catalog serving separate from chat: a failed refresh must not tear down

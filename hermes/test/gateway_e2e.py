@@ -45,6 +45,21 @@ class FakeQoder(BaseHTTPRequestHandler):
                 "is_default": True, "is_vl": False, "is_reasoning": True,
                 "max_input_tokens": 128000, "max_output_tokens": 4096,
             }]})
+        elif "/sash/api/v2/me/usage" in self.path:
+            # The sash surface takes the token from the jobToken exchange
+            # (`sashToken`), never the PAT. Assert it here so a regression that
+            # forwards the PAT upstream fails this fixture instead of silently
+            # 401-ing in production.
+            assert self.headers.get("authorization") == "Bearer sash-token-example", (
+                self.headers.get("authorization")
+            )
+            self.reply({"qoderUsage": {
+                "userType": "personal_standard",
+                "expiresAt": 4102444800000,
+                "userQuota": {"total": 1000, "used": 250, "remaining": 750, "percentage": 25},
+                "addOnQuota": {"total": 200, "used": 0, "remaining": 200, "percentage": 0},
+                "isQuotaExceeded": False,
+            }})
         else:
             self.send_error(404)
 
@@ -214,6 +229,28 @@ def main():
             assert probe("Bearer pt-example-only") == 200
             assert probe("Bearer " + gateway.api_key) == 200
             assert probe("Bearer pt-not-this-gateway") == 401
+
+            # 额度端点和目录同一条只读判据：宿主手里是 secret 或原始 PAT 都行。
+            # 回的是上游 `qoderUsage` 原样，网关不折算 —— 口径归宿主。
+            def usage(authorization):
+                request = urllib.request.Request(
+                    gateway.base_url + "/usage",
+                    headers={"authorization": authorization, "accept": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        return response.status, json.load(response)
+                except urllib.error.HTTPError as error:
+                    return error.code, None
+
+            status, body = usage("Bearer " + gateway.api_key)
+            assert status == 200, status
+            assert body["object"] == "usage", body
+            assert body["data"]["userQuota"]["remaining"] == 750, body
+            assert body["data"]["addOnQuota"]["remaining"] == 200, body
+            assert usage("Bearer pt-example-only")[0] == 200
+            assert usage("Bearer pt-not-this-gateway")[0] == 401
+
             chat_body = json.dumps({
                 "model": "demo-model", "stream": False,
                 "messages": [{"role": "user", "content": "hello"}],

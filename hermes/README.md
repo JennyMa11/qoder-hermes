@@ -20,7 +20,7 @@ python3 install.py
 ```
 
 安装目标是 `$HERMES_HOME/plugins/model-providers/qoder-cn/`（默认 `~/.hermes`）。只复制
-`__init__.py`、`runtime.py`、`plugin.yaml` 和 `gateway.mjs`，不依赖源码目录继续存在。仓库里的
+`__init__.py`、`runtime.py`、`usage.py`、`plugin.yaml` 和 `gateway.mjs`，不依赖源码目录继续存在。仓库里的
 `gateway.mjs` 是已构建产物（`pnpm build` 会重新生成），因此安装不要求本机有 esbuild。
 修改代码后重新执行 `pnpm build && python3 install.py`，并重启 Hermes。
 
@@ -77,8 +77,8 @@ hermes auth priority qoder-cn account-a 0
 
 ## 当前范围与风险
 
-- 已实现：单 PAT、动态模型目录、流式文本、工具调用、非流式调用、多 PAT 池、进程退出清理。
-- 不包含：Qoder 国际版、签到/积分 UI。
+- 已实现：单 PAT、动态模型目录、流式文本、工具调用、非流式调用、多 PAT 池、积分余额显示、进程退出清理。
+- 不包含：Qoder 国际版、签到（每日领取）操作。
 - Qoder cosy 是私有上游协议，字段或鉴权方式改变时网关可能需要同步更新。
 - 没有配置真实 PAT 时不能进行线上验证；测试使用本地假 Qoder 上游，不代表上游服务可用性。
 
@@ -104,6 +104,28 @@ Hermes 的**辅助任务**——智能审批、标题生成、上下文压缩、
 正是它当前持有的 api_key，走 `.env` 时那就是原始 PAT。计费端点（`POST /v1/chat/completions`）
 仍然只认随机 secret，所以「PAT 不当 API key 发给上游」这条约束不变。
 
+## 积分余额
+
+```sh
+hermes usage --provider qoder-cn          # 人类可读
+hermes usage --provider qoder-cn --json   # 机器可读
+```
+
+插件实现 Hermes 的 `fetch_account_usage` hook，走的是本账号自己的回环网关（`GET /v1/usage`），
+所以 PAT 仍然只留在网关进程里，不会为了查余额再发给别处。`/usage` 在会话里也会显示同一份数据。
+
+口径（与 DSH 卡片一致）：基础额度 `userQuota` 与加油包 `addOnQuota` 按 `total` 计，组织包
+`orgResourcePackage` 按 `cap` 计，三者剩余相加就是「Credits remaining」；`size <= 0` 的包跳过。
+`expiresAt` 是**账号套餐/试用到期**，不是积分到期，因此只作为一行 `Plan expires: YYYY-MM-DD`，
+不做成倒计时窗口。国际版的专属资源包（`dedicatedResourcePackages`）只对特定模型生效，不并入
+总额 —— 并进去会显示一个用户实际花不掉的数字；国内版本来也不返回这个字段。
+
+一个坑值得记下：`hermes usage` 的加载顺序和普通对话不同 —— `agent.account_usage` 在半初始化
+状态下来请求插件 profile，所以插件里任何模块级的 `from agent.account_usage import ...` 都会让
+`ImportError` 被插件加载边界吞掉，表现出来就是「这个 provider 没有 usage 端点」，而且只有
+`hermes usage` 会坏。映射代码因此在函数体内导入，`hermes/test/cli_e2e.py` 也用真实
+`hermes usage` 断言这份数据。
+
 ## 验证
 
 ```sh
@@ -111,10 +133,12 @@ pnpm install
 pnpm build
 pnpm run check
 python3 test/gateway_e2e.py
+python3 test/usage_unit.py
 ```
 
 `pnpm run check` 会额外通过真实 `hermes -z` 进程验证流式对话、工具执行及工具结果回传，使用
-隔离的临时 `HERMES_HOME`，不改动真实配置。`pnpm-workspace.yaml` 的 `allowBuilds` 只放行本包
+隔离的临时 `HERMES_HOME`，不改动真实配置；随后再用真实 `hermes usage` 断言积分数据能穿过
+插件与网关读出来。`pnpm-workspace.yaml` 的 `allowBuilds` 只放行本包
 唯一声明需要构建脚本的依赖 `esbuild`（用于打 bundle）；运行网关本身不需要它，安装到 Hermes
 后也不依赖本目录。
 

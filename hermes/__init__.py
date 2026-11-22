@@ -7,6 +7,7 @@ from pathlib import Path
 
 from providers import ProviderProfile, register_provider
 from .runtime import GatewayManager, _PLACEHOLDER, create_client, prepare_pool_entry
+from .usage import fetch_account_usage
 
 _manager = GatewayManager(Path(__file__).resolve().parent)
 
@@ -43,6 +44,17 @@ class QoderCNProfile(ProviderProfile):
             return [item["id"] for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")]
         except Exception:
             return None
+
+    def fetch_account_usage(self, *, base_url=None, api_key=None):
+        """/usage hook: Qoder credits, read through this PAT's loopback gateway.
+
+        The gateway already owns the PAT→jobToken exchange, so this hook never
+        talks to Qoder itself — it asks the local shim, which is the only place
+        allowed to hold the credential. ``api_key`` is None on some Hermes
+        surfaces (``hermes usage`` resolves the credential itself only for its
+        built-in fetchers); usage.py then runs Hermes' own resolution ladder.
+        """
+        return fetch_account_usage(_manager, api_key)
 
 
 profile = QoderCNProfile(

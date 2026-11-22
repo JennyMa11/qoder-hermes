@@ -75,14 +75,15 @@ hermes model
 | 上下文窗口透传 | ✅ 上游声明的 `context_length` |
 | 思考档位 | 网关透传 `reasoning_effort` |
 | 多账号池 | ✅ 每条池记录独立网关 |
+| 积分余额 | ✅ `hermes usage --provider qoder-cn` |
 | Qoder 国际版 | ❌ 仅国内版 |
-| 签到 / 积分 / 图形设置 | ❌ |
+| 签到 / 图形设置 | ❌ |
 
 非流式不是可选项：Hermes 的辅助任务（智能审批、标题生成、上下文压缩）走普通 `create()`，
 Qoder 上游只有 SSE，所以由网关把 delta 聚合成标准 `chat.completion`。缺了它主对话照常，
 但每轮都会退化成人工审批。
 
-账号池、签到、积分与图形设置页属于上游的 DSH 插件形态，本项目不包含。
+签到（每日领取）与图形设置页属于上游的 DSH 插件形态，本项目不包含；积分只做只读展示。
 
 ## 验证
 
@@ -91,8 +92,9 @@ cd hermes && pnpm install && pnpm build && pnpm run check
 ```
 
 检查会启动真实 `hermes -z` 子进程，在隔离的临时 `HERMES_HOME` 里对着**本地假 Qoder 上游**
-验证流式文本、工具调用与工具结果回传。**全部测试使用 `pt-example-only` 之类假凭据，没有用
-真实 PAT 打过线上 Qoder**——上游可用性无法由这些测试证明。
+验证流式文本、工具调用、工具结果回传，以及 `hermes usage` 能否读到网关透出的积分余额。
+**全部测试使用 `pt-example-only` 之类假凭据，没有用真实 PAT 打过线上 Qoder**——上游可用性
+无法由这些测试证明。
 
 ## 许可与致谢
 

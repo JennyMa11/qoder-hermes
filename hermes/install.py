@@ -9,7 +9,7 @@ def install(destination: Path) -> Path:
     source = Path(__file__).resolve().parent
     target = destination.expanduser().resolve()
     target.mkdir(parents=True, exist_ok=True)
-    for name in ("__init__.py", "runtime.py", "plugin.yaml", "gateway.mjs", "README.md"):
+    for name in ("__init__.py", "runtime.py", "usage.py", "plugin.yaml", "gateway.mjs", "README.md"):
         origin = source / name
         if not origin.is_file():
             raise RuntimeError(f"Missing {name}; run the Hermes gateway build first")

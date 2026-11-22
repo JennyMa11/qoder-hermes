@@ -6,7 +6,7 @@ Hermes 插件的协议层。没有原生（native addon）依赖，也不引用�
 | 文件 | 职责 |
 | --- | --- |
 | [`upstream.ts`](upstream.ts) | Qoder 上游 HTTP 客户端：cosy 签名、PAT→jobToken 交换、聊天 SSE、模型目录、用量与错误分类 |
-| [`shim.ts`](shim.ts) | 回环 OpenAI 兼容网关：`/v1/chat/completions`（仅流式）、`/v1/models`、Host/Origin/secret 校验、账号故障转移 |
+| [`shim.ts`](shim.ts) | 回环 OpenAI 兼容网关：`/v1/chat/completions`（流式与非流式）、`/v1/models`、`/v1/usage`、Host/Origin/secret 校验、账号故障转移 |
 | [`catalog.ts`](catalog.ts) | 模型目录解析：上游 DTO → 内部模型信息、静态兜底目录、区域/路由器模型过滤 |
 | [`cosy.ts`](cosy.ts) | cosy 传输体编解码（RSA + AES） |
 | [`messages.ts`](messages.ts) | OpenAI messages → Qoder 模板、`applyModelKey`、工具定义转换 |
@@ -26,6 +26,11 @@ Hermes 插件的协议层。没有原生（native addon）依赖，也不引用�
 | 可选 `refreshModels` | 回答 `/v1/models` 前先刷新目录，避免把启动时的静态兜底数字固化进宿主的窗口缓存。 |
 | 支持 `stream:false` | 把上游 SSE 聚合成 `chat.completion`。Hermes 的辅助任务（审批/标题/压缩）只走非流式。 |
 | 只读端点接受本进程 PAT | Hermes 的窗口探测带的是它持有的 api_key（`.env` 路径下就是 PAT）。计费端点仍只认随机 secret。 |
+| 可选 `usageOf` | 新增 `GET /v1/usage`，把上游 `qoderUsage` 原样透出，供宿主显示积分余额。不传时该路径 404，DSH 行为不变。 |
+
+`/v1/usage` 只做透传：「哪几个包算总积分」的口径留在宿主侧（本仓库里是
+[`hermes/usage.py`](../hermes/usage.py)），协议层不替宿主做账，避免两端漂移。上游没返回
+余额时回 404 `usage_unavailable`，而不是回 0 —— 「这次没读到」和「额度用完了」不是一件事。
 
 `stream` 的判据也改成了 OpenAI 语义「缺席即 false」。原先写作 `!== false`，导致不带该字段
 的请求被当成流式、回了一段 SSE 给期待 JSON 的客户端；这是 Hermes 日志里

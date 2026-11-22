@@ -1858,6 +1858,14 @@ function createQoderShim(options) {
       await handleModels(res);
       return;
     }
+    if (req.method === "GET" && url.pathname === "/v1/usage" && options.usageOf !== void 0) {
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: "invalid api key", code: "invalid_api_key" } });
+        return;
+      }
+      await handleUsage(res);
+      return;
+    }
     if (!checkAuthorization(req, secretBuf)) {
       writeJson(res, 401, { error: { message: "invalid api key", code: "invalid_api_key" } });
       return;
@@ -1922,6 +1930,24 @@ function createQoderShim(options) {
   }
   function listModelIds() {
     return [...options.listModelIds?.() ?? []];
+  }
+  async function handleUsage(res) {
+    let usage;
+    try {
+      usage = await options.usageOf?.();
+    } catch (error) {
+      if (isQoderUpstreamError(error) && (error.status === 401 || error.status === 403)) {
+        const mapped = ERROR_MAP[error.kind] ?? { status: 500, code: "internal_error" };
+        writeJson(res, error.status, { error: { message: hostFailureMessageOf(error), code: mapped.code } });
+        return;
+      }
+      usage = void 0;
+    }
+    if (usage === void 0 || usage === null) {
+      writeJson(res, 404, { error: { message: "usage is unavailable", code: "usage_unavailable" } });
+      return;
+    }
+    writeJson(res, 200, { object: "usage", data: usage });
   }
   async function handleChat(req, res) {
     let raw;
@@ -2657,7 +2683,12 @@ async function main() {
     modelLimitsOf: (id) => {
       const model = byKey.get(id);
       return model === void 0 ? void 0 : { context_length: model.contextWindow, max_tokens: model.maxOutputTokens };
-    }
+    },
+    // 额度读数原样交给宿主：上游 `qoderUsage` 的形状（userQuota/addOnQuota/
+    // orgResourcePackage/isQuotaExceeded）由宿主自己解释成它要的卡片。网关不在这里
+    // 折算成百分比——「哪几包算总积分」是产品口径（DSH 侧写在 src/index.ts 的
+    // `creditsOf` 里），协议层替宿主决定会让两边慢慢漂移。
+    usageOf: () => upstream.fetchUsage(pat)
   });
   const catalog = createServer2((req, res) => {
     const finish = (status, body) => {

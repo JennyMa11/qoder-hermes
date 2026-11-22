@@ -174,6 +174,17 @@ export interface QoderShimOptions {
    */
   refreshModels?: () => Promise<void>
   /**
+   * 账号额度（积分）读数，用于 `GET /v1/usage`（可选）。
+   *
+   * 只读、且走 `checkReadOnlyAuthorization`：宿主既可能拿随机 secret 来问，也可能
+   * 拿原始 PAT 来问（Hermes 走 `.env` 那条路时手里就是 PAT）。返回 `undefined`
+   * 表示「这次没读到」（网络抖动、上游 5xx），不是「额度是 0」——两者必须分开，
+   * 否则界面会把一次失败画成一笔用光的积分。
+   *
+   * 未实现时该端点 404，与 DSH 侧行为完全一致。
+   */
+  usageOf?: () => Promise<unknown>
+  /**
    * 该模型在设置里保存的思考强度档位（模型显示名 → 档位名）。
    *
    * 「设置里选一次、之后每个请求自动带上」——与 Qoder 客户端同形态
@@ -606,6 +617,15 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
       await handleModels(res)
       return
     }
+    if (req.method === 'GET' && url.pathname === '/v1/usage' && options.usageOf !== undefined) {
+      // 与目录同一条判据：只读、不花积分、调用方本来就已经持有自己的凭据。
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: 'invalid api key', code: 'invalid_api_key' } })
+        return
+      }
+      await handleUsage(res)
+      return
+    }
     if (!checkAuthorization(req, secretBuf)) {
       writeJson(res, 401, { error: { message: 'invalid api key', code: 'invalid_api_key' } })
       return
@@ -699,6 +719,32 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
     // The Host owns the roster; this shim serves the ids of the current catalog
     // so OpenAI clients that enumerate before model selection see the same set.
     return [...(options.listModelIds?.() ?? [])]
+  }
+
+  /**
+   * `GET /v1/usage`：把上游额度读数原样回给宿主。
+   *
+   * 读不到时回 404 而不是 200 + 空对象 —— 宿主（Hermes）把「有快照」当成
+   * 「这个 provider 有额度可显示」，一个 200 的空壳会让它渲染一张全空的卡片。
+   * 上游明确拒绝凭据（401/403）时才把状态往外传，其余一律按「这次没读到」处理。
+   */
+  async function handleUsage(res: import('node:http').ServerResponse): Promise<void> {
+    let usage: unknown
+    try {
+      usage = await options.usageOf?.()
+    } catch (error) {
+      if (isQoderUpstreamError(error) && (error.status === 401 || error.status === 403)) {
+        const mapped = ERROR_MAP[error.kind] ?? { status: 500, code: 'internal_error' }
+        writeJson(res, error.status, { error: { message: hostFailureMessageOf(error), code: mapped.code } })
+        return
+      }
+      usage = undefined
+    }
+    if (usage === undefined || usage === null) {
+      writeJson(res, 404, { error: { message: 'usage is unavailable', code: 'usage_unavailable' } })
+      return
+    }
+    writeJson(res, 200, { object: 'usage', data: usage })
   }
 
   async function handleChat(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<void> {
