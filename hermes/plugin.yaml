@@ -1,0 +1,5 @@
+name: qoder-cn
+kind: model-provider
+version: 0.1.0
+requires_hermes: ">=0.23.3"
+description: Qoder CN PAT through a local OpenAI-compatible gateway
