@@ -133,16 +133,48 @@ def _resolve_credential(provider: str) -> str | None:
     return key or None
 
 
-def fetch_account_usage(manager: Any, api_key: str | None, *, provider: str = "qoder-cn", timeout: float = 8.0) -> AccountUsageSnapshot | None:
+def _looks_like_pat(token: str) -> bool:
+    """Whether *token* is a Qoder Personal Access Token rather than a shim secret.
+
+    Hermes passes ``/usage`` the credential the session runs on. For this provider
+    that is the **loopback shim secret** (``prepare_pool_entry`` swapped it in), not
+    the PAT: starting a gateway from it would send a local secret to Qoder's token
+    exchange and 401. PATs are documented as ``pt-…``; a shim secret is 32 random
+    bytes in base64url, so the prefix tells them apart.
+    """
+    return token.startswith("pt-")
+
+
+def fetch_account_usage(manager: Any, api_key: str | None, *, base_url: str | None = None,
+                        provider: str = "qoder-cn", timeout: float = 8.0) -> AccountUsageSnapshot | None:
     """Ask this PAT's loopback gateway for the balance it holds.
 
     The gateway owns the PAT and the PAT→jobToken exchange, so this never talks
     to Qoder directly and never sees the credential itself.
+
+    Three callers hand this hook different things, and each needs its own answer:
+
+    * ``hermes usage --provider qoder-cn`` passes ``api_key=None`` — the credential
+      is resolved here through Hermes' own ladder.
+    * A live session's ``/usage`` passes whatever its route carries, which for this
+      provider is the running gateway's **secret** (``prepare_pool_entry`` replaced
+      the PAT in place). That secret names a gateway that already exists, so reuse
+      it instead of treating it as a PAT.
+    * With a pool, that secret belongs to a gateway this module may no longer hold
+      (a plugin reload rebuilds it), and the ladder would resolve *some* PAT — not
+      necessarily the session's account. Its ``base_url`` names the right gateway,
+      so match on that before falling back to any credential.
     """
-    key = (api_key or "").strip() or _resolve_credential(provider)
-    if not key:
-        return None
-    gateway = manager.get(key)
+    token = (api_key or "").strip()
+    gateway = manager.find(token) if token else None
+    if gateway is None:
+        gateway = manager.find_by_base_url(base_url)
+    if gateway is None:
+        key = token if _looks_like_pat(token) else None
+        key = key or _resolve_credential(provider)
+        if not key:
+            return None
+        gateway = manager.get(key)
     request = urllib.request.Request(
         f"{gateway.base_url}/usage",
         headers={"authorization": f"Bearer {gateway.api_key}", "accept": "application/json"},

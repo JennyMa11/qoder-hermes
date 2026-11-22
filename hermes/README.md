@@ -126,6 +126,21 @@ hermes usage --provider qoder-cn --json   # 机器可读
 `hermes usage` 会坏。映射代码因此在函数体内导入，`hermes/test/cli_e2e.py` 也用真实
 `hermes usage` 断言这份数据。
 
+第二个坑：会话内 `/usage` 给 hook 的是路由里的 `api_key`/`base_url`，而那对值是
+`prepare_pool_entry` 换过的**回环网关 secret**，不是 PAT。把 secret 当 PAT 去 Qoder 换
+jobToken 必然 401，hook 又是 fail-open，于是整段余额静默消失 —— 命令行 `hermes usage` 因为
+传 `api_key=None` 反而一直正常。插件现在的解析顺序是：先在自己已持有的网关里按 secret
+认领（插件重载后旧网关可能已不在表里），再按 `base_url` 认到会话实际在用的那个账号，最后才
+判断手里是不是 `pt-` 开头的 PAT，否则回落 Hermes 的凭据解析。多账号池下这一步尤其重要：
+`resolve_runtime_provider` 只会解析出其中一个 PAT，可能是别的账号的。
+
+插件升级后，长驻的桌面 gateway 仍跑着旧快照（`~/.hermes/runtime/provider-plugins/` 下按
+进程冻结），此时 `/usage` 会缺这一段而命令行正常。让运行中的 gateway 重载即可，不必重启 App：
+
+```sh
+hermes gateway restart            # 或让桌面端重新加载插件
+```
+
 ## 验证
 
 ```sh
@@ -145,6 +160,13 @@ python3 test/usage_unit.py
 `hermes/test/hermes_integration.py` 和 `hermes/test/plugin_smoke.py` 需要在 Hermes bootstrap
 后的环境中运行，使用其 managed Python；直接 `python3` 运行不是 Hermes 的运行时。测试均使用
 `pt-example-only` 等假值和本地假上游，不使用真实账号。
+
+这两个测试通过 `hermes/test/isolated_home.py` 把 `HERMES_HOME` 指向系统临时目录下的
+`qoder-cn-test-home`。这不是洁癖：Hermes 用 `override=True` 加载 `$HERMES_HOME/.env`，而
+`_resolve_api_key_provider_secret` 的取值顺序刻意优先 `.env` 而非 `os.environ`，所以只
+`patch.dict(os.environ)` 的测试仍会读到开发者本人的 PAT，`plugin_smoke` 的「未配置即安全」
+断言就会假失败。目录固定而非每次 `mkdtemp` 是因为 Hermes 按 home 激活独立依赖环境，每跑一次
+新建会多花几分钟；需要换位置时设 `QODER_CN_TEST_HOME`。
 
 ## 卸载
 

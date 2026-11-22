@@ -11,6 +11,11 @@ from unittest.mock import patch
 PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN / "test"))
 from gateway_e2e import fake_upstream
+from isolated_home import isolate
+
+# Before the Hermes imports below: they read $HERMES_HOME/.env with
+# override=True, so an unisolated run resolves the developer's real PAT.
+isolate()
 
 from agent.credential_pool import PooledCredential
 from hermes_cli.auth import resolve_api_key_provider_credentials
@@ -115,6 +120,17 @@ def main():
         assert "Hello from Qoder" == "".join(
             choice.delta.content or "" for chunk in second_stream for choice in chunk.choices
         )
+
+        # The in-session `/usage` path: Hermes hands the hook the route's runtime
+        # credential, which prepare_pool_entry replaced with the gateway secret,
+        # plus that gateway's base URL. Before usage.py learned to reuse a live
+        # gateway, this pair was treated as a PAT, 401-ed at Qoder's token
+        # exchange, and the whole credits block silently vanished.
+        session_usage = profile.fetch_account_usage(
+            api_key=first.access_token, base_url=first.base_url)
+        assert session_usage is not None, "in-session /usage returned no snapshot"
+        assert session_usage.windows[0].detail == "750 of 1000 credits left"
+        assert "Credits remaining: 950" in session_usage.details
         print("PASS: real Hermes profile, single PAT, pool conversion, rotation, streaming, tools")
 
 

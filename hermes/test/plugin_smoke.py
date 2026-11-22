@@ -4,6 +4,14 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from isolated_home import isolate
+
+# Must run before the first Hermes import: a real ~/.hermes/.env would
+# otherwise win over os.environ and make the "unconfigured" case read the
+# developer's PAT.
+isolate()
+
 import hermes_bootstrap
 from providers import get_provider_profile
 from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials

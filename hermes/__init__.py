@@ -50,11 +50,14 @@ class QoderCNProfile(ProviderProfile):
 
         The gateway already owns the PAT→jobToken exchange, so this hook never
         talks to Qoder itself — it asks the local shim, which is the only place
-        allowed to hold the credential. ``api_key`` is None on some Hermes
-        surfaces (``hermes usage`` resolves the credential itself only for its
-        built-in fetchers); usage.py then runs Hermes' own resolution ladder.
+        allowed to hold the credential. The two arguments differ by surface:
+        ``hermes usage`` passes only ``api_key=None`` (usage.py then runs Hermes'
+        own resolution ladder), while a live session passes the loopback secret
+        and base URL its route runs on — the same secret ``prepare_pool_entry``
+        substituted for the PAT. usage.py decides which gateway that names, so a
+        pooled session reports the account it is actually talking to.
         """
-        return fetch_account_usage(_manager, api_key)
+        return fetch_account_usage(_manager, api_key, base_url=base_url)
 
 
 profile = QoderCNProfile(

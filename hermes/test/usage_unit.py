@@ -133,6 +133,166 @@ def test_boolean_and_string_sizes_are_ignored():
     assert snapshot.unavailable_reason
 
 
+class _Gateway:
+    def __init__(self, pat: str, secret: str, port: int = 1):
+        self.pat = pat
+        self.api_key = secret
+        self.base_url = f"http://127.0.0.1:{port}/v1"
+
+
+class _Manager:
+    """Stands in for GatewayManager: records every credential it was asked to own."""
+
+    def __init__(self, live=()):
+        self.live = list(live)
+        self.started: list[str] = []
+
+    def find(self, token):
+        return next((gateway for gateway in self.live if gateway.api_key == token), None)
+
+    def find_by_base_url(self, base_url):
+        wanted = (base_url or "").strip().rstrip("/")
+        if not wanted:
+            return None
+        return next((gateway for gateway in self.live if gateway.base_url.rstrip("/") == wanted), None)
+
+    def get(self, pat):
+        self.started.append(pat)
+        gateway = _Gateway(pat, f"secret-for-{pat}", port=2)
+        self.live.append(gateway)
+        return gateway
+
+
+def _capture_fetch(monkeypatch_calls):
+    """Patch urlopen to answer /usage with one balance and record the caller's secret."""
+    real = usage.urllib.request.urlopen
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        monkeypatch_calls.append(request)
+        body = b'{"object":"usage","data":{"userQuota":{"total":10,"used":4,"remaining":6}}}'
+        return _Response(body)
+
+    usage.urllib.request.urlopen = fake_urlopen
+    return real
+
+
+def test_session_secret_reuses_the_running_gateway():
+    # A live session's /usage hands over the loopback secret, not the PAT.
+    gateway = _Gateway("pt-example-only", "shim-secret")
+    manager = _Manager(live=[gateway])
+    calls = []
+    real = _capture_fetch(calls)
+    resolved = []
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: resolved.append(provider) or "pt-example-only"
+    try:
+        snapshot = usage.fetch_account_usage(manager, "shim-secret")
+    finally:
+        usage.urllib.request.urlopen = real
+        usage._resolve_credential = real_resolve
+    assert snapshot is not None
+    assert snapshot.windows[0].detail == "6 of 10 credits left"
+    assert manager.started == []  # never spawn a gateway from a local secret
+    assert resolved == []  # and no need to resolve a PAT when one is already live
+    assert calls[0].full_url == "http://127.0.0.1:1/v1/usage"
+
+
+def test_stale_secret_falls_back_to_the_real_pat():
+    # After a plugin reload the running gateway belongs to the previous module, so
+    # this manager cannot find it by secret OR by base URL. Treating the secret as
+    # a PAT would 401 at Qoder.
+    manager = _Manager()
+    calls = []
+    real = _capture_fetch(calls)
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: "pt-example-only"
+    try:
+        snapshot = usage.fetch_account_usage(manager, "stale-shim-secret")
+    finally:
+        usage.urllib.request.urlopen = real
+        usage._resolve_credential = real_resolve
+    assert snapshot is not None
+    assert manager.started == ["pt-example-only"]
+
+
+def test_base_url_picks_the_pooled_account_the_session_runs_on():
+    # Two accounts in the pool; the session runs on the second. Its secret belongs to
+    # a gateway this module no longer holds, and the ladder would resolve the FIRST
+    # PAT — the wrong account's balance. The route's base_url must win.
+    first = _Gateway("pt-example-only", "secret-one", port=11)
+    second = _Gateway("pt-example-other", "secret-two", port=12)
+    manager = _Manager(live=[first, second])
+    calls = []
+    real = _capture_fetch(calls)
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: "pt-example-only"
+    try:
+        snapshot = usage.fetch_account_usage(
+            manager, "secret-two-rotated", base_url="http://127.0.0.1:12/v1")
+    finally:
+        usage.urllib.request.urlopen = real
+        usage._resolve_credential = real_resolve
+    assert snapshot is not None
+    assert manager.started == []
+    assert calls[0].full_url == "http://127.0.0.1:12/v1/usage"
+
+
+def test_unknown_base_url_still_resolves_a_credential():
+    manager = _Manager()
+    calls = []
+    real = _capture_fetch(calls)
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: "pt-example-only"
+    try:
+        snapshot = usage.fetch_account_usage(
+            manager, "stale-shim-secret", base_url="qoder-cn://local/v1")
+    finally:
+        usage.urllib.request.urlopen = real
+        usage._resolve_credential = real_resolve
+    assert snapshot is not None
+    assert manager.started == ["pt-example-only"]
+
+
+def test_pat_from_a_pool_entry_starts_its_own_gateway():
+    manager = _Manager()
+    calls = []
+    real = _capture_fetch(calls)
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: (_ for _ in ()).throw(AssertionError("must not resolve"))
+    try:
+        snapshot = usage.fetch_account_usage(manager, "pt-example-only")
+    finally:
+        usage.urllib.request.urlopen = real
+        usage._resolve_credential = real_resolve
+    assert snapshot is not None
+    assert manager.started == ["pt-example-only"]
+
+
+def test_no_credential_anywhere_returns_none():
+    manager = _Manager()
+    real_resolve = usage._resolve_credential
+    usage._resolve_credential = lambda provider: None
+    try:
+        assert usage.fetch_account_usage(manager, None) is None
+        assert usage.fetch_account_usage(manager, "shim-secret") is None
+    finally:
+        usage._resolve_credential = real_resolve
+    assert manager.started == []
+
+
 def main():
     failures = 0
     for name, function in sorted(globals().items()):

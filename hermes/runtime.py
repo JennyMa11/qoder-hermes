@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
-from typing import Any
+from typing import Any, Callable
 
 _PLACEHOLDER = "qoder-cn://local/v1"
 
@@ -90,6 +90,36 @@ class GatewayManager:
         self._gateways: dict[str, Gateway] = {}
         self._lock = threading.Lock()
         atexit.register(self.close)
+
+    def find(self, token: str) -> Gateway | None:
+        """The live gateway that already owns *token*, without ever starting one.
+
+        A caller that may be holding a shim secret rather than a PAT (Hermes hands
+        ``/usage`` whatever credential the session runs on) must not fall through to
+        ``get()``: that would spawn a gateway whose "PAT" is a local secret, send it
+        to Qoder's token exchange, and quietly burn a 401.
+        """
+        return self._find(lambda gateway: gateway.api_key == token) if isinstance(token, str) and token.strip() else None
+
+    def find_by_base_url(self, base_url: str | None) -> Gateway | None:
+        """The live gateway serving *base_url* — the account, not just the credential.
+
+        With a pool, several gateways run at once and one Hermes ladder resolves
+        only one PAT. The route a session reports carries the ``base_url`` it talks
+        to, so matching on that names the account whose balance the user is looking
+        at, even when its secret is not the one this module happens to hold.
+        """
+        if not isinstance(base_url, str) or not base_url.strip():
+            return None
+        wanted = base_url.strip().rstrip("/")
+        return self._find(lambda gateway: gateway.base_url.rstrip("/") == wanted)
+
+    def _find(self, match: Callable[[Gateway], bool]) -> Gateway | None:
+        with self._lock:
+            for current in self._gateways.values():
+                if current._process.poll() is None and match(current):
+                    return current
+        return None
 
     def get(self, pat: str) -> Gateway:
         if not isinstance(pat, str) or not pat.strip():
