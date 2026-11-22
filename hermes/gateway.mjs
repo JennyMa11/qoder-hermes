@@ -1730,6 +1730,69 @@ function sleepAbortable(ms, signal) {
     }, { once: true });
   });
 }
+function newCompletionDraft() {
+  return { role: "", content: "", reasoning: "", notice: void 0, toolCalls: /* @__PURE__ */ new Map() };
+}
+function accumulateDelta(draft, delta) {
+  if (delta.role !== "") draft.role = delta.role;
+  draft.content += delta.content;
+  draft.reasoning += delta.reasoningContent;
+  if (delta.toolCalls === void 0) return;
+  delta.toolCalls.forEach((raw, position) => {
+    if (raw === null || typeof raw !== "object") return;
+    const record = raw;
+    const index = typeof record.index === "number" ? record.index : position;
+    const fn = record.function ?? {};
+    const current = draft.toolCalls.get(index) ?? { id: "", type: "function", name: "", arguments: "" };
+    if (typeof record.id === "string" && record.id !== "") current.id = record.id;
+    if (typeof record.type === "string" && record.type !== "") current.type = record.type;
+    if (typeof fn.name === "string" && fn.name !== "" && current.name === "") current.name = fn.name;
+    if (typeof fn.arguments === "string" && fn.arguments !== "") current.arguments += fn.arguments;
+    draft.toolCalls.set(index, current);
+  });
+}
+function buildCompletion(draft, meta) {
+  const calls = [...draft.toolCalls.entries()].sort(([left], [right]) => left - right).map(([index, call]) => ({
+    index,
+    id: call.id || `call_${index}`,
+    type: call.type || "function",
+    function: { name: call.name, arguments: call.arguments }
+  }));
+  const notice = draft.notice === void 0 ? "" : `
+
+> [qoder-cn] ${draft.notice}
+
+`;
+  const text2 = notice + draft.content;
+  const message = {
+    role: draft.role || "assistant",
+    // 有工具调用而正文为空时按 OpenAI 语义给 null：空串会被读成「模型说了空话」。
+    content: text2 === "" && calls.length > 0 ? null : text2
+  };
+  if (draft.reasoning !== "") message.reasoning_content = draft.reasoning;
+  if (calls.length > 0) message.tool_calls = calls;
+  const body = {
+    id: meta.id,
+    object: "chat.completion",
+    created: meta.created,
+    model: meta.model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: calls.length > 0 ? "tool_calls" : "stop"
+    }]
+  };
+  if (meta.inputTokens > 0 || meta.outputTokens > 0) {
+    body.usage = {
+      prompt_tokens: meta.inputTokens,
+      completion_tokens: meta.outputTokens,
+      total_tokens: meta.inputTokens + meta.outputTokens,
+      // 与流式路径同一口径：`cached_tokens` 是 `prompt_tokens` 的子集。
+      ...meta.cachedTokens === void 0 ? {} : { prompt_tokens_details: { cached_tokens: meta.cachedTokens } }
+    };
+  }
+  return body;
+}
 function createQoderShim(options) {
   const { upstream } = options;
   const logger = options.logger ?? (() => {
@@ -1778,21 +1841,29 @@ function createQoderShim(options) {
       writeJson(res, 403, { error: { message: "Origin must be a loopback origin", code: "origin_not_allowed" } });
       return;
     }
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (req.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/healthz/")) {
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: "invalid api key", code: "invalid_api_key" } });
+        return;
+      }
+      writeJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/v1/models") {
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: "invalid api key", code: "invalid_api_key" } });
+        return;
+      }
+      await handleModels(res);
+      return;
+    }
     if (!checkAuthorization(req, secretBuf)) {
       writeJson(res, 401, { error: { message: "invalid api key", code: "invalid_api_key" } });
       return;
     }
     if (!checkContentType(req)) {
       writeJson(res, 415, { error: { message: "unsupported media type", code: "invalid_request_error" } });
-      return;
-    }
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (req.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/healthz/")) {
-      writeJson(res, 200, { ok: true });
-      return;
-    }
-    if (req.method === "GET" && url.pathname === "/v1/models") {
-      await handleModels(res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
@@ -1814,6 +1885,18 @@ function createQoderShim(options) {
     if (actual.length !== expected.length) return false;
     return timingSafeEqual(actual, expected);
   }
+  function checkReadOnlyAuthorization(req, expected) {
+    if (checkAuthorization(req, expected)) return true;
+    const header = req.headers.authorization;
+    const match = typeof header === "string" ? /^Bearer (.+)$/.exec(header) : null;
+    if (!match) return false;
+    const credential = options.credential();
+    if (!credential) return false;
+    const actual = Buffer.from(match[1] ?? "");
+    const wanted = Buffer.from(credential);
+    if (actual.length !== wanted.length) return false;
+    return timingSafeEqual(actual, wanted);
+  }
   function checkContentType(req) {
     if (req.method === "GET") return true;
     const ct = req.headers["content-type"] ?? "";
@@ -1827,8 +1910,14 @@ function createQoderShim(options) {
     return pat;
   }
   async function handleModels(res) {
+    if (options.refreshModels !== void 0) await options.refreshModels();
     const ids = listModelIds();
-    const models = ids.map((id) => ({ id, object: "model", owned_by: "qoder" }));
+    const models = ids.map((id) => ({
+      id,
+      object: "model",
+      owned_by: "qoder",
+      ...options.modelLimitsOf?.(id) ?? {}
+    }));
     writeJson(res, 200, { object: "list", data: models });
   }
   function listModelIds() {
@@ -1854,7 +1943,7 @@ function createQoderShim(options) {
     }
     const model = typeof body.model === "string" ? body.model : "";
     const messages = Array.isArray(body.messages) ? body.messages : [];
-    const stream = body.stream !== false;
+    const stream = body.stream === true;
     const sessionId = ["session_id", "x-session-affinity", "x-client-request-id"].map((name) => req.headers[name]).find((value) => typeof value === "string" && value !== "");
     if (messages.length === 0) {
       writeJson(res, 400, { error: { message: "messages is required", code: "invalid_request_error" } });
@@ -1874,8 +1963,7 @@ function createQoderShim(options) {
       return;
     }
     if (!stream) {
-      writeJson(res, 400, { error: { message: "only streaming is supported", code: "invalid_request_error" } });
-      return;
+      logger(`shim: non-streaming request for ${model}; aggregating upstream SSE locally`);
     }
     const toolChoice = body.tool_choice;
     const tools = toolChoice === "none" || !Array.isArray(body.tools) ? void 0 : body.tools;
@@ -1920,6 +2008,8 @@ function createQoderShim(options) {
       let inputTokens = 0;
       let outputTokens = 0;
       let cachedTokens;
+      const draft = stream ? void 0 : newCompletionDraft();
+      let sawDelta = false;
       try {
         await upstream.chatStream(serving.pat, key, messages, {
           ...tools === void 0 ? {} : { tools },
@@ -1929,6 +2019,17 @@ function createQoderShim(options) {
           isVl: supportsImages,
           signal: controller.signal,
           onDelta: (delta) => {
+            if (draft !== void 0) {
+              if (!sawDelta) {
+                sawDelta = true;
+                if (notice !== void 0 && !wroteBytes) draft.notice = notice;
+              }
+              if (delta.inputTokens > 0) inputTokens = delta.inputTokens;
+              if (delta.outputTokens > 0) outputTokens = delta.outputTokens;
+              if (delta.cachedTokens !== void 0) cachedTokens = delta.cachedTokens;
+              accumulateDelta(draft, delta);
+              return;
+            }
             if (!wroteAny) {
               res.writeHead(200, {
                 "Content-Type": "text/event-stream",
@@ -1951,6 +2052,18 @@ function createQoderShim(options) {
             writeDeltaChunk(res, requestId, created, model, delta);
           }
         });
+        if (draft !== void 0) {
+          if (res.destroyed) return;
+          writeJson(res, 200, buildCompletion(draft, {
+            id: requestId,
+            created,
+            model,
+            inputTokens,
+            outputTokens,
+            cachedTokens
+          }));
+          return;
+        }
         if (res.destroyed) return;
         const done = makeChunk(requestId, created, model);
         done.choices[0].finish_reason = hasToolCalls ? "tool_calls" : "stop";
@@ -2523,12 +2636,28 @@ async function main() {
   const upstream = new QoderUpstreamClient("cn", upstreamOptions);
   const models = usable(QODER_FALLBACK_MODELS.map(fallbackModelInfo));
   const byKey = new Map(models.map((model) => [model.key, model]));
+  const refreshCatalog = async () => {
+    const remote = await upstream.fetchModels(pat);
+    for (const raw of remote) {
+      const info = parseUpstreamModel(raw);
+      if (usable([info]).length) byKey.set(info.key, info);
+    }
+  };
   const shim = await createQoderShim({
     upstream,
     credential: () => pat,
     modelKeyOf: (id) => byKey.get(id)?.key,
     supportsImagesOf: (id) => byKey.get(id)?.supportsImages ?? false,
-    listModelIds: () => [...byKey.keys()]
+    listModelIds: () => [...byKey.keys()],
+    // 刷新失败不能影响目录的可用性：保留上一份已知目录比空列表诚实。
+    refreshModels: () => refreshCatalog().catch(() => {
+    }),
+    // 上游目录声明的窗口/输出上限原样交给宿主：Hermes 只从 /models 读这两个数，
+    // 缺了它就以 256K 硬默认代替（并打告警），压缩阈值也跟着算错。
+    modelLimitsOf: (id) => {
+      const model = byKey.get(id);
+      return model === void 0 ? void 0 : { context_length: model.contextWindow, max_tokens: model.maxOutputTokens };
+    }
   });
   const catalog = createServer2((req, res) => {
     const finish = (status, body) => {
@@ -2551,13 +2680,22 @@ async function main() {
           id: model.key,
           object: "model",
           owned_by: "qoder-cn",
-          context_window: model.contextWindow,
+          // 字段名必须是 `context_length`：Hermes 的 model_metadata 只认这个名字
+          // （`_CONTEXT_LENGTH_KEYS` 里有它，却没有 `context_window`）。写成后者
+          // 等于没写 —— 宿主会以 256K 硬默认代替，并打一条 probe-down 告警。
+          context_length: model.contextWindow,
           max_tokens: model.maxOutputTokens
         }))
       });
     })().catch(() => finish(200, {
       object: "list",
-      data: [...byKey.values()].map((model) => ({ id: model.key, object: "model", owned_by: "qoder-cn" }))
+      data: [...byKey.values()].map((model) => ({
+        id: model.key,
+        object: "model",
+        owned_by: "qoder-cn",
+        context_length: model.contextWindow,
+        max_tokens: model.maxOutputTokens
+      }))
     }));
   });
   catalog.listen(0, "127.0.0.1");

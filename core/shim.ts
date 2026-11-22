@@ -156,6 +156,24 @@ export interface QoderShimOptions {
    */
   listModelIds?: () => readonly string[]
   /**
+   * 该模型在上游声明的窗口与输出上限，写进 `/v1/models` 的条目。
+   *
+   * Hermes 把 `/models` 当作上下文窗口的唯一来源：缺字段就退回 256K 的硬默认
+   * 并打告警（`Could not determine context length`），而那个数字既不是上游声明的
+   * 值，也会让 `/context` 与压缩阈值按错的窗口算。上游目录本来就有这两个数，
+   * 没有理由不递过去。返回 undefined 表示该模型没有声明的值。
+   */
+  modelLimitsOf?: (modelId: string) => { context_length?: number, max_tokens?: number } | undefined
+  /**
+   * 在回 `/v1/models` 之前刷新目录（可选）。失败必须被实现方吞掉并保留上一份目录。
+   *
+   * 为什么需要：`listModelIds` / `modelLimitsOf` 读的是进程内缓存的目录，而 Hermes
+   * 的上下文窗口探测只打这个端点、且结果会落盘。若不在这里刷新，宿主拿到的永远是
+   * 启动时的静态兜底数字（与上游真实声明可能不同），而 `/model` 选择器走的是另一
+   * 条会刷新的路径 —— 两边各说一套。
+   */
+  refreshModels?: () => Promise<void>
+  /**
    * 该模型在设置里保存的思考强度档位（模型显示名 → 档位名）。
    *
    * 「设置里选一次、之后每个请求自动带上」——与 Qoder 客户端同形态
@@ -415,6 +433,106 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
+/**
+ * 非流式请求的累加器：把上游的 delta 帧聚合成一个 OpenAI `chat.completion`。
+ *
+ * 为什么需要它（这不是可选项）：宿主并不只用流式。Hermes 的**辅助任务**
+ * ——智能审批、标题生成、上下文压缩——走的是普通 `create()`（`stream=false`，
+ * 期望 `.choices[0].message`）。此前这一档被 400 拒掉，于是每个回合都会出现
+ * 「Auxiliary: main provider qoder-cn is unavailable」并退化到人工审批，而主流
+ * 对话看起来完全正常。上游只吐 SSE，所以非流式必须由本层自己聚合。
+ *
+ * `tool_calls` 按 `index` 归并：上游把同一通调用的 `arguments` 分帧发送，
+ * 直接覆盖只会留下最后一小段 JSON。名字则由上游一次给全，故只认第一个非空值
+ * ——分帧拼接会在重复发名的网关上把函数名写两遍。
+ */
+interface CompletionDraft {
+  role: string
+  content: string
+  reasoning: string
+  /**
+   * 换号提示：流式时它是首帧里的一个引用块，非流式时它只能并进正文——但要留到
+   * 聚合完成再并，否则会被后续 delta 追加到提示**前面**。
+   */
+  notice: string | undefined
+  toolCalls: Map<number, { id: string; type: string; name: string; arguments: string }>
+}
+
+function newCompletionDraft(): CompletionDraft {
+  return { role: '', content: '', reasoning: '', notice: undefined, toolCalls: new Map() }
+}
+
+function accumulateDelta(draft: CompletionDraft, delta: QoderChatDelta): void {
+  if (delta.role !== '') draft.role = delta.role
+  draft.content += delta.content
+  draft.reasoning += delta.reasoningContent
+  if (delta.toolCalls === undefined) return
+  ;(delta.toolCalls as Array<Record<string, unknown>>).forEach((raw, position) => {
+    if (raw === null || typeof raw !== 'object') return
+    const record = raw as Record<string, unknown>
+    const index = typeof record.index === 'number' ? record.index : position
+    const fn = (record.function ?? {}) as Record<string, unknown>
+    const current = draft.toolCalls.get(index) ?? { id: '', type: 'function', name: '', arguments: '' }
+    if (typeof record.id === 'string' && record.id !== '') current.id = record.id
+    if (typeof record.type === 'string' && record.type !== '') current.type = record.type
+    if (typeof fn.name === 'string' && fn.name !== '' && current.name === '') current.name = fn.name
+    if (typeof fn.arguments === 'string' && fn.arguments !== '') current.arguments += fn.arguments
+    draft.toolCalls.set(index, current)
+  })
+}
+
+/** 把累加器收敛成 `chat.completion`。usage 只在拿到 token 数时附带。 */
+function buildCompletion(
+  draft: CompletionDraft,
+  meta: {
+    id: string
+    created: number
+    model: string
+    inputTokens: number
+    outputTokens: number
+    cachedTokens: number | undefined
+  },
+): Record<string, unknown> {
+  const calls = [...draft.toolCalls.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([index, call]) => ({
+      index,
+      id: call.id || `call_${index}`,
+      type: call.type || 'function',
+      function: { name: call.name, arguments: call.arguments },
+    }))
+  const notice = draft.notice === undefined ? '' : `\n\n> [qoder-cn] ${draft.notice}\n\n`
+  const text = notice + draft.content
+  const message: Record<string, unknown> = {
+    role: draft.role || 'assistant',
+    // 有工具调用而正文为空时按 OpenAI 语义给 null：空串会被读成「模型说了空话」。
+    content: text === '' && calls.length > 0 ? null : text,
+  }
+  if (draft.reasoning !== '') message.reasoning_content = draft.reasoning
+  if (calls.length > 0) message.tool_calls = calls
+  const body: Record<string, unknown> = {
+    id: meta.id,
+    object: 'chat.completion',
+    created: meta.created,
+    model: meta.model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: calls.length > 0 ? 'tool_calls' : 'stop',
+    }],
+  }
+  if (meta.inputTokens > 0 || meta.outputTokens > 0) {
+    body.usage = {
+      prompt_tokens: meta.inputTokens,
+      completion_tokens: meta.outputTokens,
+      total_tokens: meta.inputTokens + meta.outputTokens,
+      // 与流式路径同一口径：`cached_tokens` 是 `prompt_tokens` 的子集。
+      ...meta.cachedTokens === undefined ? {} : { prompt_tokens_details: { cached_tokens: meta.cachedTokens } },
+    }
+  }
+  return body
+}
+
 export function createQoderShim(options: QoderShimOptions): QoderShim {
   const { upstream } = options
   const logger = options.logger ?? (() => {})
@@ -469,22 +587,31 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
       writeJson(res, 403, { error: { message: 'Origin must be a loopback origin', code: 'origin_not_allowed' } })
       return
     }
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    // 只读路由先判，用更宽的凭据判据（见 checkReadOnlyAuthorization）：Hermes 的
+    // 上下文窗口探测带的是它自己持有的 api_key，走 `.env` 时那是原始 PAT。
+    if (req.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/healthz/')) {
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: 'invalid api key', code: 'invalid_api_key' } })
+        return
+      }
+      writeJson(res, 200, { ok: true })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/models') {
+      if (!checkReadOnlyAuthorization(req, secretBuf)) {
+        writeJson(res, 401, { error: { message: 'invalid api key', code: 'invalid_api_key' } })
+        return
+      }
+      await handleModels(res)
+      return
+    }
     if (!checkAuthorization(req, secretBuf)) {
       writeJson(res, 401, { error: { message: 'invalid api key', code: 'invalid_api_key' } })
       return
     }
     if (!checkContentType(req)) {
       writeJson(res, 415, { error: { message: 'unsupported media type', code: 'invalid_request_error' } })
-      return
-    }
-
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    if (req.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/healthz/')) {
-      writeJson(res, 200, { ok: true })
-      return
-    }
-    if (req.method === 'GET' && url.pathname === '/v1/models') {
-      await handleModels(res)
       return
     }
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
@@ -509,6 +636,32 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
     return timingSafeEqual(actual, expected)
   }
 
+  /**
+   * 只读端点（`/v1/models`、`/healthz`）额外接受**本进程自己的** PAT。
+   *
+   * 为什么必须这样：Hermes 的 `model_metadata` 会拿它**当前持有的 api_key** 去
+   * `base_url + /models` 探上下文窗口。走 `.env` 的那条路里，宿主手里的就是原始
+   * PAT（`prepare_pool_entry` 不在链上），于是探测必然 401 —— 日志里那句
+   * 「Could not detect context length … defaulting to 256,000 tokens (probe-down)」
+   * 就是这个原因，而不是上游不可达。
+   *
+   * 这不扩大暴露面：调用方本来就已经持有 PAT，端点只监听回环、且有 Host/Origin
+   * 校验，而这里**只**对只读的目录查询放开 —— 计费请求（POST /chat/completions）
+   * 仍然只认随机 secret，所以「PAT 不当 API key 发给上游」那条约束不变。
+   */
+  function checkReadOnlyAuthorization(req: import('node:http').IncomingMessage, expected: Buffer): boolean {
+    if (checkAuthorization(req, expected)) return true
+    const header = req.headers.authorization
+    const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header) : null
+    if (!match) return false
+    const credential = options.credential()
+    if (!credential) return false
+    const actual = Buffer.from(match[1] ?? '')
+    const wanted = Buffer.from(credential)
+    if (actual.length !== wanted.length) return false
+    return timingSafeEqual(actual, wanted)
+  }
+
   function checkContentType(req: import('node:http').IncomingMessage): boolean {
     if (req.method === 'GET') return true
     const ct = req.headers['content-type'] ?? ''
@@ -525,8 +678,20 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
 
   async function handleModels(res: import('node:http').ServerResponse): Promise<void> {
     // 目录由宿主维护，shim 只回 id 列表；这里从 catalog 的 key 派生出 id 序列。
+    // 同时带上 `context_length`：Hermes 的 model_metadata 会把 `/models` 当作
+    // 上下文窗口的**唯一**来源，只回 id 时它只能退回 256K 的硬默认并打一条
+    // 「Could not determine context length」告警 —— 那个数字不是上游声明的值。
+    //
+    // 先刷新一次再列：这个端点的结果会被宿主落盘成窗口值，用启动时的静态兜底
+    // 回答它等于把一个可能与上游不一致的数字固化下来（实现方已吞掉失败）。
+    if (options.refreshModels !== undefined) await options.refreshModels()
     const ids = listModelIds()
-    const models = ids.map((id) => ({ id, object: 'model', owned_by: 'qoder' }))
+    const models = ids.map((id) => ({
+      id,
+      object: 'model',
+      owned_by: 'qoder',
+      ...(options.modelLimitsOf?.(id) ?? {}),
+    }))
     writeJson(res, 200, { object: 'list', data: models })
   }
 
@@ -558,7 +723,13 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
     }
     const model = typeof body.model === 'string' ? body.model : ''
     const messages = Array.isArray(body.messages) ? body.messages as Array<Record<string, unknown>> : []
-    const stream = body.stream !== false
+    // OpenAI 语义：`stream` **缺席就是 false**。此前写成 `!== false`，于是任何
+    // 不带该字段的请求（Hermes 的辅助任务：智能审批 / 标题 / 压缩，走普通
+    // `create()`，SDK 根本不会写这个键）都被当成流式，回了一段 SSE 给一个
+    // 期待 JSON 的客户端 —— 宿主只看到 `type=str` 的响应体，报「invalid
+    // provider response」，然后每回合退化一次。主对话路径显式发 `stream:true`，
+    // 不受影响。
+    const stream = body.stream === true
     /**
      * 会话标识（issue #42）：DSH 每轮把它的 `session.id` 盖成 `session_id` 头
      * （pi-ai 的 session-affinity 机制，我们在 `adapter.ts` 的 compat 里开了
@@ -595,9 +766,11 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
       return
     }
 
+    // 非流式请求不再被拒：上游只有 SSE，本层自己聚合成 `chat.completion`。
+    // 宿主的辅助任务（智能审批 / 标题 / 压缩）走的就是这条路，拒掉它们会让
+    // 每个回合都退化一次（见 `buildCompletion` 的说明）。
     if (!stream) {
-      writeJson(res, 400, { error: { message: 'only streaming is supported', code: 'invalid_request_error' } })
-      return
+      logger(`shim: non-streaming request for ${model}; aggregating upstream SSE locally`)
     }
 
     // `tool_choice` 的处理与 workbuddy 的 prepareChatBody 同义：cosy 模板没有
@@ -697,6 +870,11 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
        * 报过就记下来（含 0），不再被后面的帧覆盖成别的数。
        */
       let cachedTokens: number | undefined
+      // 非流式：只累加，不写字节。`sawDelta` 与流式的 `wroteAny` 作用相同——
+      // 首个 delta 到达即算「已提交」，此后失败只能原样回错，不能再换号重放
+      // （换号会让客户端看到两段拼接的回答）。
+      const draft = stream ? undefined : newCompletionDraft()
+      let sawDelta = false
       try {
         await upstream.chatStream(serving.pat, key, messages, {
           ...(tools === undefined ? {} : { tools }),
@@ -706,6 +884,20 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
           isVl: supportsImages,
           signal: controller.signal,
           onDelta: (delta) => {
+            if (draft !== undefined) {
+              if (!sawDelta) {
+                sawDelta = true
+                // 提示排在正文之前。**不**在这里置 `wroteBytes`：非流式还没有任何
+                // 字节交给客户端，换号重放时提示仍该出现（流式的首帧一旦写出就
+                // 不能再写，所以那边由 `wroteAny` 承担这个闸门）。
+                if (notice !== undefined && !wroteBytes) draft.notice = notice
+              }
+              if (delta.inputTokens > 0) inputTokens = delta.inputTokens
+              if (delta.outputTokens > 0) outputTokens = delta.outputTokens
+              if (delta.cachedTokens !== undefined) cachedTokens = delta.cachedTokens
+              accumulateDelta(draft, delta)
+              return
+            }
             if (!wroteAny) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
@@ -739,6 +931,15 @@ export function createQoderShim(options: QoderShimOptions): QoderShim {
             writeDeltaChunk(res, requestId, created, model, delta)
           },
         })
+        if (draft !== undefined) {
+          // 非流式收尾：一个完整的 `chat.completion`，形状与 OpenAI 一致
+          // （宿主读 `.choices[0].message`）。
+          if (res.destroyed) return
+          writeJson(res, 200, buildCompletion(draft, {
+            id: requestId, created, model, inputTokens, outputTokens, cachedTokens,
+          }))
+          return
+        }
         // chatStream 正常结束：统计块 + [DONE]。finish_reason 依据是否出现过
         // tool_call；有 token 统计时附带 usage。
         if (res.destroyed) return

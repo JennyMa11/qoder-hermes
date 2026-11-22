@@ -54,12 +54,38 @@ async function main(): Promise<void> {
   const models = usable(QODER_FALLBACK_MODELS.map(fallbackModelInfo))
   const byKey = new Map(models.map(model => [model.key, model]))
 
+  /**
+   * 从上游刷新目录（就地更新 `byKey`）。
+   *
+   * 两个端点共用它：shim 的 `/v1/models` 与独立的 catalog 服务。此前只有 catalog
+   * 服务会刷新，而 Hermes 的上下文窗口探测打的是 **shim** 的 `/v1/models` ——
+   * 于是它永远读到静态兜底里的数字（180000），而上游真实声明是 200000。两边
+   * 各说一套，用户看到的窗口取决于哪条路径先跑。
+   */
+  const refreshCatalog = async (): Promise<void> => {
+    const remote = await upstream.fetchModels(pat)
+    for (const raw of remote) {
+      const info = parseUpstreamModel(raw)
+      if (usable([info]).length) byKey.set(info.key, info)
+    }
+  }
+
   const shim = await createQoderShim({
     upstream,
     credential: () => pat,
     modelKeyOf: id => byKey.get(id)?.key,
     supportsImagesOf: id => byKey.get(id)?.supportsImages ?? false,
     listModelIds: () => [...byKey.keys()],
+    // 刷新失败不能影响目录的可用性：保留上一份已知目录比空列表诚实。
+    refreshModels: () => refreshCatalog().catch(() => {}),
+    // 上游目录声明的窗口/输出上限原样交给宿主：Hermes 只从 /models 读这两个数，
+    // 缺了它就以 256K 硬默认代替（并打告警），压缩阈值也跟着算错。
+    modelLimitsOf: id => {
+      const model = byKey.get(id)
+      return model === undefined
+        ? undefined
+        : { context_length: model.contextWindow, max_tokens: model.maxOutputTokens }
+    },
   })
 
   // Keep catalog serving separate from chat: a failed refresh must not tear down
@@ -85,13 +111,22 @@ async function main(): Promise<void> {
           id: model.key,
           object: 'model',
           owned_by: 'qoder-cn',
-          context_window: model.contextWindow,
+          // 字段名必须是 `context_length`：Hermes 的 model_metadata 只认这个名字
+          // （`_CONTEXT_LENGTH_KEYS` 里有它，却没有 `context_window`）。写成后者
+          // 等于没写 —— 宿主会以 256K 硬默认代替，并打一条 probe-down 告警。
+          context_length: model.contextWindow,
           max_tokens: model.maxOutputTokens,
         })),
       })
     })().catch(() => finish(200, {
       object: 'list',
-      data: [...byKey.values()].map(model => ({ id: model.key, object: 'model', owned_by: 'qoder-cn' })),
+      data: [...byKey.values()].map(model => ({
+        id: model.key,
+        object: 'model',
+        owned_by: 'qoder-cn',
+        context_length: model.contextWindow,
+        max_tokens: model.maxOutputTokens,
+      })),
     }))
   })
   catalog.listen(0, '127.0.0.1')

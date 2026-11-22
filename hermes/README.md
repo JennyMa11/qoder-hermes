@@ -77,10 +77,32 @@ hermes auth priority qoder-cn account-a 0
 
 ## 当前范围与风险
 
-- 已实现：单 PAT、动态模型目录、流式文本、工具调用、多 PAT 池、进程退出清理。
-- 不包含：Qoder 国际版、签到/积分 UI、非流式 `stream: false`。
+- 已实现：单 PAT、动态模型目录、流式文本、工具调用、非流式调用、多 PAT 池、进程退出清理。
+- 不包含：Qoder 国际版、签到/积分 UI。
 - Qoder cosy 是私有上游协议，字段或鉴权方式改变时网关可能需要同步更新。
 - 没有配置真实 PAT 时不能进行线上验证；测试使用本地假 Qoder 上游，不代表上游服务可用性。
+
+## 非流式调用
+
+Qoder 上游只有 SSE，本网关自己把 delta 聚合成标准的 `chat.completion`。这条路径不是可选的：
+Hermes 的**辅助任务**——智能审批、标题生成、上下文压缩、Vision 判定——都发普通的
+`create()`（不带 `stream`，期望 `.choices[0].message`）。网关拒掉它们时主对话看起来完全正常，
+但每一轮都会在日志里留下 `Auxiliary: main provider qoder-cn is unavailable`，并退化成人工
+审批。OpenAI 语义是「`stream` 缺席即 false」，所以网关也按这个判据分流。
+
+工具调用在同一路径上按 `index` 归并分帧的 `arguments`，聚合结果可直接
+`json.loads()`；有工具调用且正文为空时 `content` 是 `null`（OpenAI 语义）。
+
+## 上下文窗口
+
+网关的 `/v1/models` 会带上上游声明的 `context_length` 与 `max_tokens`，并在回答前列一次
+上游目录。Hermes 把 `/models` 当作上下文窗口的**唯一**来源：缺这两个字段时它会退回 256K 的
+硬默认并打一条 `Could not detect context length ... (probe-down)`，压缩阈值也跟着按错的窗口
+算。
+
+只读端点（`/v1/models`、`/healthz`）额外接受本网关自己的 PAT —— Hermes 的元数据探测带的
+正是它当前持有的 api_key，走 `.env` 时那就是原始 PAT。计费端点（`POST /v1/chat/completions`）
+仍然只认随机 secret，所以「PAT 不当 API key 发给上游」这条约束不变。
 
 ## 验证
 

@@ -133,12 +133,15 @@ def main():
             other.close()
             assert other_process.wait(timeout=5) == 0
 
-            def chat(tools=None):
+            def chat(tools=None, stream=True):
                 payload = {
-                    "model": "demo-model", "stream": True,
-                    "stream_options": {"include_usage": True},
+                    "model": "demo-model",
                     "messages": [{"role": "user", "content": "hello"}],
                 }
+                # `stream` 缺席必须按非流式处理（OpenAI 语义），所以只在要流式时写它。
+                if stream:
+                    payload["stream"] = True
+                    payload["stream_options"] = {"include_usage": True}
                 if tools is not None:
                     payload["tools"] = tools
                 request = urllib.request.Request(
@@ -163,8 +166,61 @@ def main():
             assert "call_demo" in tool_text
             assert '\\"city\\":\\"Paris\\"' in tool_text
             assert '"finish_reason":"tool_calls"' in tool_text
+
+            # 非流式（Hermes 辅助任务的路径）：必须回一个真正的 chat.completion，
+            # 而不是 SSE 文本。这曾经是每回合「Auxiliary ... unavailable」的根因——
+            # 不带 `stream` 字段的请求被当成流式，客户端只拿到一串 `data: {...}`。
+            completion = json.loads(chat(stream=False))
+            assert completion["object"] == "chat.completion", completion
+            message = completion["choices"][0]["message"]
+            assert message["content"] == "Hello from Qoder", message
+            assert completion["choices"][0]["finish_reason"] == "stop", completion
+            assert completion["usage"]["prompt_tokens"] == 8, completion
+
+            # 非流式 + 工具：`arguments` 分帧归并后必须是完整 JSON。
+            tool_completion = json.loads(chat(
+                [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+                stream=False,
+            ))
+            tool_message = tool_completion["choices"][0]["message"]
+            assert tool_completion["choices"][0]["finish_reason"] == "tool_calls", tool_completion
+            assert tool_message["content"] is None, tool_message
+            call = tool_message["tool_calls"][0]
+            assert call["function"]["name"] == "get_weather", call
+            assert json.loads(call["function"]["arguments"]) == {"city": "Paris"}, call
+
             with urllib.request.urlopen(gateway.models_url, timeout=5) as response:
-                assert any(model["id"] == "demo-model" for model in json.load(response)["data"])
+                catalog = json.load(response)["data"]
+                assert any(model["id"] == "demo-model" for model in catalog)
+                # 上游目录声明的窗口要透传出去：Hermes 的 model_metadata 只从
+                # `/models` 读这个数，缺了就以 256K 硬默认代替。
+                entry = next(model for model in catalog if model["id"] == "demo-model")
+                assert entry.get("context_length") == 128000, entry
+                assert entry.get("max_tokens") == 4096, entry
+
+            # 只读端点接受本进程的 PAT（Hermes 的上下文探测带的就是它）；
+            # 计费端点仍然只认随机 secret —— PAT 绝不能被当 API key 发到上游。
+            def probe(authorization, method="GET", path="/models", body=None):
+                request = urllib.request.Request(
+                    gateway.base_url + path, data=body, method=method,
+                    headers={"authorization": authorization, "content-type": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        return response.status
+                except urllib.error.HTTPError as error:
+                    return error.code
+
+            assert probe("Bearer pt-example-only") == 200
+            assert probe("Bearer " + gateway.api_key) == 200
+            assert probe("Bearer pt-not-this-gateway") == 401
+            chat_body = json.dumps({
+                "model": "demo-model", "stream": False,
+                "messages": [{"role": "user", "content": "hello"}],
+            }).encode()
+            assert probe("Bearer pt-example-only", "POST", "/chat/completions", chat_body) == 401
+            assert probe("Bearer " + gateway.api_key, "POST", "/chat/completions", chat_body) == 200
+
             request = urllib.request.Request(gateway.base_url + "/chat/completions", data=b"{}", headers={"content-type": "application/json"})
             try:
                 urllib.request.urlopen(request, timeout=5)
