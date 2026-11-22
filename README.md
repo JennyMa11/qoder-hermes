@@ -45,10 +45,11 @@ Hermes 始终用 OpenAI-compatible 客户端，而 Qoder 没有官方 OpenAI 端
 ## 安装
 
 要求 **Hermes Agent v0.23.3+**、**Node.js 22.19+**，并保留本仓库完整目录（`hermes/` 通过相对
-路径引用 `core/`）。
+路径引用 `core/`，因此不能只拷贝 `hermes/`）。
 
 ```bash
-cd hermes
+git clone https://github.com/JennyMa11/qoder-hermes.git
+cd qoder-hermes/hermes
 pnpm install
 pnpm build
 python3 install.py            # 复制到 $HERMES_HOME/plugins/model-providers/qoder-cn/
