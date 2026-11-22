@@ -1,8 +1,7 @@
-# core — Qoder 协议实现（共享）
+# core — Qoder 协议实现
 
-`pi/` 与 `hermes/` 共用的协议层。没有原生（native addon）依赖，也不引用任何 DSH 包；
-只依赖 Node 内置模块与 `fetch`，因此可以被 Pi 的 TS 加载器直接 import，也能被 esbuild
-打成单个文件供 Hermes 用。
+Hermes 插件的协议层。没有原生（native addon）依赖，也不引用任何 DSH 包；只依赖 Node
+内置模块与 `fetch`，由 esbuild 打成单个文件随插件分发。
 
 | 文件 | 职责 |
 | --- | --- |

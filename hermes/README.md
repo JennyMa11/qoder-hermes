@@ -8,7 +8,7 @@ Hermes 核心，也不需要常驻手工启动服务。**
 
 - Hermes Agent v0.23.3（本机实测版本）
 - Node.js 22.19+
-- Qoder 国内版 PAT。不要把国际版 PAT 填到这里；Pi 扩展提供单独的 `qoder-global`。
+- Qoder 国内版 PAT。国际版（`qoder.sh`）令牌互不通用，填进来会在认证交换阶段被拒。
 
 ## 安装
 
