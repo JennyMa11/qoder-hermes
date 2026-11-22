@@ -135,11 +135,16 @@ jobToken 必然 401，hook 又是 fail-open，于是整段余额静默消失 —
 `resolve_runtime_provider` 只会解析出其中一个 PAT，可能是别的账号的。
 
 插件升级后，长驻的桌面 gateway 仍跑着旧快照（`~/.hermes/runtime/provider-plugins/` 下按
-进程冻结），此时 `/usage` 会缺这一段而命令行正常。让运行中的 gateway 重载即可，不必重启 App：
+进程冻结），此时 `/usage` 会缺这一段而命令行正常。重载即可：
 
 ```sh
-hermes gateway restart            # 或让桌面端重新加载插件
+hermes gateway restart
 ```
+
+不想中断会话时，可以直接对该 profile 的控制 socket（`$HERMES_HOME/gateway.sock`）发一条
+`reload-plugins` 动词：运行中的 gateway 会强制重新发现插件，把新快照冻结进
+`runtime/provider-plugins/` 供之后的会话使用。这也是一次性 CLI 能立刻看到新版本、桌面端却
+要等一次重载的原因。
 
 ## 验证
 
